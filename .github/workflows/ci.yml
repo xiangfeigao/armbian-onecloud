@@ -11,23 +11,18 @@ on:
 env:
   SCRIPT_REPO: ${{ github.repository }}
   SCRIPT_REF: ${{ github.ref_name }}
-  # 使用可靠的U-Boot仓库
-  UBOOT_REPO: armbian/u-boot
-  UBOOT_TAG: v2023.10  # 使用固定版本
-  UBOOT_BURNIMG: u-boot.bin
+  UBOOT_REPO: hzyitc/u-boot-onecloud
+  UBOOT_RELEASE: latest
+  UBOOT_BURNIMG: eMMC.burn.img
   ARMBIAN_REPO: armbian/build
   ARMBIAN_REF: main
   PATCHES: 4077,5076
   PATCHES_DISABLED: 5082
-  # 内核参数
   KERNEL_MAJOR_MINOR: "6.1"
   LINUXFAMILY: "meson8b"
-  # 构建参数
-  COMPRESS_OUTPUTIMAGE: "img"
-  FORCE_BINARIES: "yes"
-  # 防止dialog错误
-  DEBIAN_FRONTEND: "noninteractive"
-  KERNEL_CONFIGURE: "no"
+
+permissions:
+  contents: write
 
 jobs:
   prepare:
@@ -39,12 +34,12 @@ jobs:
       - id: get
         name: Get repositories information
         run: |
-          TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          TIME="$(curl https://api.github.com/repos/${SCRIPT_REPO}/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
           TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
-          
-          # 直接使用预定义的UBOOT_TAG，避免API调用失败
-          SCRIPT_SHA=$(curl -s https://api.github.com/repos/${SCRIPT_REPO}/commits/${SCRIPT_REF} | jq -r .sha || echo ${{ github.sha }})
-          ARMBIAN_SHA=$(curl -s https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
+
+          SCRIPT_SHA=$(curl https://api.github.com/repos/${SCRIPT_REPO}/commits/${SCRIPT_REF} | jq -r .sha)
+          UBOOT_TAG=$(curl https://api.github.com/repos/${UBOOT_REPO}/releases/${UBOOT_RELEASE} | jq -r .tag_name)
+          ARMBIAN_SHA=$(curl https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
 
           cat <<EOF | sed -E 's/^  //' >>$GITHUB_ENV
             TIME=$TIME
@@ -54,6 +49,15 @@ jobs:
             ARMBIAN_SHA=$ARMBIAN_SHA
           EOF
           echo "env=$(cat $GITHUB_ENV | base64 -w 0)" >>$GITHUB_OUTPUT
+
+      - name: Show repositories information
+        run: |
+          echo -e "Build environment prepared with:\n"
+          echo "TIME: $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')"
+          echo "Script: ${SCRIPT_REPO}@${SCRIPT_REF} (${SCRIPT_SHA})"
+          echo "U-Boot: ${UBOOT_REPO}@${UBOOT_RELEASE} (${UBOOT_TAG})"
+          echo "Armbian: ${ARMBIAN_REPO}@${ARMBIAN_REF} (${ARMBIAN_SHA})"
+          [[ -n "${PATCHES}" ]] && echo -e "\nPatches: ${PATCHES//,/, }"
 
   build-debs:
     name: Build ${{ matrix.BRANCH }}
@@ -77,19 +81,9 @@ jobs:
 
       - name: Prepare build environment
         run: |
-          # 创建必要的扩展目录
-          mkdir -p userpatches/extensions
-          
-          # 安装必要依赖
-          sudo apt-get update && sudo apt-get install -y \
-            jq curl img2simg parted udev \
-            gcc make bc device-tree-compiler \
-            u-boot-tools flex bison libssl-dev \
-            python3-dev swig python3-distutils
-            
+          sudo apt-get update && sudo apt-get install -y jq curl img2simg
           mkdir -p config/kernel/ userpatches/kernel/archive/meson8b-6.1/
           
-          # 下载内核配置
           if [ ! -f "config/kernel/linux-meson8b-current.config" ]; then
             curl -L -o config/kernel/linux-meson8b-current.config \
               https://raw.githubusercontent.com/hzyitc/armbian-onecloud/main/config/kernel/linux-meson8b-current.config || \
@@ -115,8 +109,7 @@ jobs:
               EXPERT=yes \
               USE_CCACHE=no \
               KERNEL_MAJOR_MINOR=${{ env.KERNEL_MAJOR_MINOR }} \
-              LINUXFAMILY=${{ env.LINUXFAMILY }} \
-              KERNEL_CONFIGURE=${{ env.KERNEL_CONFIGURE }}
+              LINUXFAMILY=${{ env.LINUXFAMILY }}
           sudo chown -R $(id -u):$(id -g) output/
 
       - name: Upload debs
@@ -160,11 +153,6 @@ jobs:
 
       - name: Build system image
         run: |
-          set -x
-          # 确保输出目录存在
-          mkdir -p output/images/
-          
-          # 构建镜像（添加详细日志和必要参数）
           export GITHUB_ACTIONS=false
           sudo --preserve-env \
             ./compile.sh build \
@@ -172,7 +160,7 @@ jobs:
               BOARD=onecloud \
               BRANCH=${{ matrix.BRANCH }} \
               RELEASE=${{ matrix.RELEASE }} \
-              KERNEL_CONFIGURE=${{ env.KERNEL_CONFIGURE }} \
+              KERNEL_CONFIGURE=no \
               BUILD_MINIMAL=${{ matrix.TYPE == 'minimal' && 'yes' || 'no' }} \
               BUILD_DESKTOP=${{ matrix.TYPE == 'desktop' && 'yes' || 'no' }} \
               DESKTOP_ENVIRONMENT=${{ matrix.DESKTOP_ENVIRONMENT }} \
@@ -182,34 +170,22 @@ jobs:
               SKIP_EXTERNAL_TOOLCHAINS=yes \
               CLEAN_LEVEL=none \
               USE_CCACHE=no \
-              COMPRESS_OUTPUTIMAGE=${{ env.COMPRESS_OUTPUTIMAGE }} \
-              FORCE_BINARIES=${{ env.FORCE_BINARIES }} \
-              KERNEL_MAJOR_MINOR=${{ env.KERNEL_MAJOR_MINOR }} \
-              LINUXFAMILY=${{ env.LINUXFAMILY }}
-              
-          # 验证镜像生成
-          if [ -z "$(ls output/images/*.img 2>/dev/null)" ]; then
-            echo "Error: No image files generated!"
-            echo "Build log tail:"
-            tail -n 100 output/debug/compile.log || true
-            exit 1
-          fi
-          
+              COMPRESS_OUTPUTIMAGE=img \
+              FORCE_BINARIES=yes
           sudo chown -R $(id -u):$(id -g) output/
 
       - name: Install dependencies for image processing
         run: |
-          sudo apt install -y img2simg parted
-          curl -L -o ./AmlImg \
-            https://github.com/hzyitc/AmlImg/releases/download/v0.3.2/AmlImg_v0.3.2_linux_amd64
+          sudo apt install -y img2simg
+          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/v0.3.2/AmlImg_v0.3.2_linux_amd64
           chmod +x ./AmlImg
 
-      - name: Process non-burning images
+      - name: Process images (non-burning version)
         run: |
           # 处理普通镜像
           for img in output/images/*.img; do
             if [[ "$img" != *".burn.img" ]]; then
-              echo "Processing regular image: $img"
+              # 生成校验和并压缩
               sha256sum "$img" >> sha256sum
               xz --threads=0 --compress "$img"
             fi
@@ -217,51 +193,24 @@ jobs:
 
       - name: Process burning version
         run: |
-          set -e
-          # 确保有镜像文件生成
-          diskimg=$(ls output/images/*.img 2>/dev/null | grep -v ".burn.img" | head -1)
-          if [ -z "$diskimg" ]; then
-            echo "Error: No base image found for burning version"
-            ls -la output/images/ || true
-            exit 1
-          fi
-          
-          echo "Processing burning version for: $diskimg"
-          
           # 准备烧录镜像目录
           mkdir -p burn/
           
-          # 下载U-Boot（使用预定义的URL）
-          curl -L -o ./uboot.img \
-            https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG} || {
-            echo "Failed to download U-Boot"
-            exit 1
-          }
+          # 下载U-Boot
+          curl -L -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
           
           # 处理系统镜像
-          echo "Setting up loop device for $diskimg"
-          loop=$(sudo losetup --find --show --partscan "$diskimg")
-          echo "Loop device: $loop"
-          
-          echo "Creating sparse images..."
-          sudo img2simg ${loop}p1 burn/boot.simg || {
-            echo "Failed to create boot.simg"
-            sudo losetup -d $loop
-            exit 1
-          }
-          sudo img2simg ${loop}p2 burn/rootfs.simg || {
-            echo "Failed to create rootfs.simg"
-            sudo losetup -d $loop
-            exit 1
-          }
+          diskimg=$(ls output/images/*.img | grep -v ".burn.img")
+          loop=$(sudo losetup --find --show --partscan $diskimg)
+          sudo img2simg ${loop}p1 burn/boot.simg
+          sudo img2simg ${loop}p2 burn/rootfs.simg
           sudo losetup -d $loop
           
           # 生成校验文件
-          echo "Generating verification files..."
           echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" > burn/boot.VERIFY
           echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" > burn/rootfs.VERIFY
           
-          # 创建烧录命令文件
+          # 创建烧录镜像
           cat <<EOF > burn/commands.txt
           PARTITION:boot:sparse:boot.simg
           VERIFY:boot:normal:boot.VERIFY
@@ -287,20 +236,38 @@ jobs:
           EOF
           
           # 生成烧录镜像
-          prefix=$(basename "$diskimg" .img)
-          ./AmlImg pack "output/images/${prefix}.burn.img" burn/package.xml || {
-            echo "Failed to generate burn image"
-            exit 1
-          }
+          prefix=$(basename $diskimg .img)
+          ./AmlImg pack output/images/${prefix}.burn.img burn/package.xml
           
           # 处理烧录镜像
-          sha256sum "output/images/${prefix}.burn.img" >> sha256sum
-          xz --threads=0 --compress "output/images/${prefix}.burn.img"
+          sha256sum output/images/${prefix}.burn.img >> sha256sum
+          xz --threads=0 --compress output/images/${prefix}.burn.img
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: images-${{ matrix.RELEASE }}-${{ matrix.TYPE }}
+          name: ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
           path: |
             output/images/*.img.xz
+            output/images/*.burn.img.xz
             sha256sum
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            output/images/*.img.xz
+            output/images/*.burn.img.xz
+          body: |
+            Build completed at $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')
+            
+            ### SHA256 Checksums
+            $(cat sha256sum | awk '{printf "- %s: `%s`\n", $2, $1}')
+            
+            ### Build Details
+            - Board: onecloud
+            - Branch: ${{ matrix.BRANCH }}
+            - Release: ${{ matrix.RELEASE }}
+            - Type: ${{ matrix.TYPE }}
+            ${{ matrix.TYPE == 'desktop' && '- Desktop: ' || ''}}${{ matrix.DESKTOP_ENVIRONMENT }}
