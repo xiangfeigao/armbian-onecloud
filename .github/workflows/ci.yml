@@ -13,7 +13,7 @@ env:
   SCRIPT_REF: ${{ github.ref_name }}
   # 使用已知可用的U-Boot仓库
   UBOOT_REPO: armbian/u-boot
-  UBOOT_TAG: v2023.10  # 使用固定tag避免获取失败
+  UBOOT_TAG: v2023.10  # 使用固定版本
   UBOOT_BURNIMG: u-boot.bin
   ARMBIAN_REPO: armbian/build
   ARMBIAN_REF: main
@@ -51,15 +51,6 @@ jobs:
             ARMBIAN_SHA=$ARMBIAN_SHA
           EOF
           echo "env=$(cat $GITHUB_ENV | base64 -w 0)" >>$GITHUB_OUTPUT
-
-      - name: Show repositories information
-        run: |
-          echo -e "Build environment prepared with:\n"
-          echo "TIME: $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')"
-          echo "Script: ${SCRIPT_REPO}@${SCRIPT_REF} (${SCRIPT_SHA})"
-          echo "U-Boot: ${UBOOT_REPO}@${UBOOT_TAG} (using predefined tag)"
-          echo "Armbian: ${ARMBIAN_REPO}@${ARMBIAN_REF} (${ARMBIAN_SHA})"
-          [[ -n "${PATCHES}" ]] && echo -e "\nPatches: ${PATCHES//,/, }"
 
   build-debs:
     name: Build ${{ matrix.BRANCH }}
