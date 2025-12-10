@@ -59,6 +59,35 @@ jobs:
           echo "Armbian: ${ARMBIAN_REPO}@${ARMBIAN_REF} (${ARMBIAN_SHA})"
           [[ -n "${PATCHES}" ]] && echo -e "\nPatches: ${PATCHES//,/, }"
 
+      - name: Generate release informations
+        run: |
+          cat <<EOF | sed -E 's/^  //' | tee Release.md
+            CI $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')
+
+            # Sources
+            Script: [${SCRIPT_REPO}@${SCRIPT_REF}](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_REF}) ([\`${SCRIPT_SHA}\`](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_SHA}))
+            U-Boot: [${UBOOT_REPO}@${UBOOT_RELEASE}](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_RELEASE}) ([\`${UBOOT_TAG}\`](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_TAG}))
+            Armbian: [${ARMBIAN_REPO}@${ARMBIAN_REF}](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_REF}) ([\`${ARMBIAN_SHA}\`](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_SHA}))
+
+            ${PATCHES:+$(
+              echo "# Patches"
+              echo "${PATCHES}" | tr ',' '\n' | sed -E 's|(.*)|[armbian/build#\1](http://github.com/armbian/build/pull/\1)|'
+            )}
+
+            # SHA256
+          EOF
+
+          # 简化release名称
+          echo "NAME=OneCloud-$(date -d "$TIME" +'%Y%m%d')" >>$GITHUB_ENV
+          tail --line=+2 Release.md >Body.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.NAME }}
+          body_path: Body.md
+
   build-debs:
     name: Build ${{ matrix.BRANCH }}
     needs: prepare
@@ -174,91 +203,50 @@ jobs:
               FORCE_BINARIES=yes
           sudo chown -R $(id -u):$(id -g) output/
 
-      - name: Install dependencies for image processing
+      - name: Process and rename images
         run: |
+          # 安装必要工具
           sudo apt install -y img2simg
-          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/v0.3.2/AmlImg_v0.3.2_linux_amd64
+          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/v0.3.1/AmlImg_v0.3.1_linux_amd64
           chmod +x ./AmlImg
 
-      - name: Process images (non-burning version)
-        run: |
-          # 处理普通镜像
+          # 处理镜像文件
           for img in output/images/*.img; do
-            if [[ "$img" != *".burn.img" ]]; then
-              # 生成校验和并压缩
-              sha256sum "$img" >> sha256sum
-              xz --threads=0 --compress "$img"
+            # 生成简化文件名
+            newname=$(basename "$img" | sed -E '
+              s/^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-//;
+              s/_Onecloud//g;
+              s/_armbian//gI;
+              s/_unofficial//gI;
+              s/^/OneCloud_/'
+            )
+            
+            # 重命名文件
+            mv "$img" "output/images/$newname"
+            
+            # 处理.burn.img文件
+            if [[ "$img" == *".burn.img" ]]; then
+              ./AmlImg pack "output/images/$newname" burn/
             fi
           done
 
-      - name: Process burning version
-        run: |
-          # 准备烧录镜像目录
-          mkdir -p burn/
-          
-          # 下载U-Boot
-          curl -L -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
-          
-          # 处理系统镜像
-          diskimg=$(ls output/images/*.img | grep -v ".burn.img")
-          loop=$(sudo losetup --find --show --partscan $diskimg)
-          sudo img2simg ${loop}p1 burn/boot.simg
-          sudo img2simg ${loop}p2 burn/rootfs.simg
-          sudo losetup -d $loop
-          
-          # 生成校验文件
-          echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" > burn/boot.VERIFY
-          echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" > burn/rootfs.VERIFY
-          
-          # 创建烧录镜像
-          cat <<EOF > burn/commands.txt
-          PARTITION:boot:sparse:boot.simg
-          VERIFY:boot:normal:boot.VERIFY
-          PARTITION:rootfs:sparse:rootfs.simg
-          VERIFY:rootfs:normal:rootfs.VERIFY
-          EOF
-          
-          # 生成XML配置文件
-          cat <<EOF > burn/package.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <package>
-            <head>
-              <product>OneCloud</product>
-              <version>1.0</version>
-            </head>
-            <body>
-              <command name="PARTITION" type="boot" filetype="sparse" filename="boot.simg"/>
-              <command name="VERIFY" type="boot" verifytype="normal" filename="boot.VERIFY"/>
-              <command name="PARTITION" type="rootfs" filetype="sparse" filename="rootfs.simg"/>
-              <command name="VERIFY" type="rootfs" verifytype="normal" filename="rootfs.VERIFY"/>
-            </body>
-          </package>
-          EOF
-          
-          # 生成烧录镜像
-          prefix=$(basename $diskimg .img)
-          ./AmlImg pack output/images/${prefix}.burn.img burn/package.xml
-          
-          # 处理烧录镜像
-          sha256sum output/images/${prefix}.burn.img >> sha256sum
-          xz --threads=0 --compress output/images/${prefix}.burn.img
+          # 生成校验和并压缩
+          for f in output/images/OneCloud_*; do
+            sha256sum "$f" >> sha256sum
+            xz --threads=0 --compress "$f"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
-          path: |
-            output/images/*.img.xz
-            output/images/*.burn.img.xz
-            sha256sum
+          path: output/images/OneCloud_*
 
-      - name: Create release
+      - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          files: |
-            output/images/*.img.xz
-            output/images/*.burn.img.xz
+          files: output/images/OneCloud_*
           body: |
             Build completed at $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')
             
