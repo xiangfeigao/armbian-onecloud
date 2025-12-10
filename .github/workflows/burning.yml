@@ -1,0 +1,317 @@
+name: burning
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - readme
+    paths:
+      - .github/workflows/burning.yml
+
+env:
+  SCRIPT_REPO: ${{ github.repository }}
+  SCRIPT_REF: ${{ github.ref_name }}
+  UBOOT_REPO: hzyitc/u-boot-onecloud
+  UBOOT_RELEASE: latest
+  UBOOT_BURNIMG: eMMC.burn.img
+  ARMBIAN_REPO: armbian/build
+  ARMBIAN_REF: main
+  PATCHES: 4077,5076
+  PATCHES_DISABLED: 5082
+  KERNEL_MAJOR_MINOR: "6.1"
+  LINUXFAMILY: "meson8b"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-22.04
+    outputs:
+      env: ${{ steps.get.outputs.env }}
+    steps:
+      - id: get
+        name: Get repositories information
+        run: |
+          TIME="$(curl -s https://api.github.com/repos/${SCRIPT_REPO}/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
+          TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
+
+          SCRIPT_SHA=$(curl -s https://api.github.com/repos/${SCRIPT_REPO}/commits/${SCRIPT_REF} | jq -r .sha)
+          UBOOT_TAG=$(curl -s https://api.github.com/repos/${UBOOT_REPO}/releases/${UBOOT_RELEASE} | jq -r .tag_name)
+          ARMBIAN_SHA=$(curl -s https://api.github.com/repos/${ARMBIAN_REPO}/commits/${ARMBIAN_REF} | jq -r .sha)
+
+          cat <<EOF | sed -E 's/^  //' >>$GITHUB_ENV
+            TIME=$TIME
+            TAG=$TAG
+            SCRIPT_SHA=$SCRIPT_SHA
+            UBOOT_TAG=$UBOOT_TAG
+            ARMBIAN_SHA=$ARMBIAN_SHA
+          EOF
+          echo "env=$(cat $GITHUB_ENV | base64 -w 0)" >>$GITHUB_OUTPUT
+
+      - name: Show repositories information
+        run: |
+          echo -e "Build environment prepared with:\n"
+          echo "TIME: $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')"
+          echo "Script: ${SCRIPT_REPO}@${SCRIPT_REF} (${SCRIPT_SHA})"
+          echo "U-Boot: ${UBOOT_REPO}@${UBOOT_RELEASE} (${UBOOT_TAG})"
+          echo "Armbian: ${ARMBIAN_REPO}@${ARMBIAN_REF} (${ARMBIAN_SHA})"
+          [[ -n "${PATCHES}" ]] && echo -e "\nPatches: ${PATCHES//,/, }"
+
+      - name: Generate release informations
+        run: |
+          cat <<EOF | sed -E 's/^  //' | tee Release.md
+            CI $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')
+
+            # Sources
+            Script: [${SCRIPT_REPO}@${SCRIPT_REF}](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_REF}) ([\`${SCRIPT_SHA}\`](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_SHA}))
+            U-Boot: [${UBOOT_REPO}@${UBOOT_RELEASE}](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_RELEASE}) ([\`${UBOOT_TAG}\`](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_TAG}))
+            Armbian: [${ARMBIAN_REPO}@${ARMBIAN_REF}](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_REF}) ([\`${ARMBIAN_SHA}\`](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_SHA}))
+
+            ${PATCHES:+$(
+              echo "# Patches"
+              echo "${PATCHES}" | tr ',' '\n' | sed -E 's|(.*)|[armbian/build#\1](http://github.com/armbian/build/pull/\1)|'
+            )}
+
+            # SHA256
+          EOF
+
+          echo "NAME=OneCloud-$(date -d "$TIME" +'%Y%m%d')" >>$GITHUB_ENV
+          tail --line=+2 Release.md >Body.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.NAME }}
+          body_path: Body.md
+
+  build-debs:
+    name: Build ${{ matrix.BRANCH }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        BRANCH: [current]
+
+    steps:
+      - name: Import env
+        run: |
+          echo "$(echo "${{ needs.prepare.outputs.env }}" | base64 -d)" >>$GITHUB_ENV
+
+      - name: Checkout Armbian
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ARMBIAN_REPO }}
+          ref: ${{ env.ARMBIAN_SHA }}
+
+      - name: Prepare build environment
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl img2simg parted udev
+          mkdir -p config/kernel/ userpatches/kernel/archive/meson8b-6.1/
+          
+          if [ ! -f "config/kernel/linux-meson8b-current.config" ]; then
+            curl -L -o config/kernel/linux-meson8b-current.config \
+              https://raw.githubusercontent.com/hzyitc/armbian-onecloud/main/config/kernel/linux-meson8b-current.config || \
+            echo "CONFIG_ARM=y" > config/kernel/linux-meson8b-current.config
+          fi
+
+      - name: Apply patches
+        if: ${{ env.PATCHES }}
+        run: |
+          for id in $(echo ${{ env.PATCHES }} | tr ',' ' '); do
+            curl -L -O "https://github.com/armbian/build/pull/${id}.patch" || echo "Failed to download patch ${id}, continuing..."
+            patch --batch -p1 -N <"${id}.patch" || echo "Patch ${id}.patch failed, continuing..."
+          done
+
+      - name: Build kernel packages
+        run: |
+          export GITHUB_ACTIONS=false
+          sudo --preserve-env \
+            ./compile.sh kernel \
+              ALLOW_ROOT=yes \
+              BOARD=onecloud \
+              BRANCH=${{ matrix.BRANCH }} \
+              EXPERT=yes \
+              USE_CCACHE=no \
+              KERNEL_MAJOR_MINOR=${{ env.KERNEL_MAJOR_MINOR }} \
+              LINUXFAMILY=${{ env.LINUXFAMILY }}
+          sudo chown -R $(id -u):$(id -g) output/
+
+      - name: Upload debs
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.BRANCH }}
+          path: output/debs/*
+
+  build:
+    name: Build ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
+    needs: [prepare, build-debs]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        BRANCH: [current]
+        RELEASE: [jammy, bullseye, bookworm]
+        TYPE: [minimal, cli, desktop]
+        include:
+          - TYPE: desktop
+            DESKTOP_ENVIRONMENT: xfce
+            DESKTOP_ENVIRONMENT_CONFIG_NAME: config_base
+            DESKTOP_APPGROUPS_SELECTED: ""
+
+    steps:
+      - name: Import env
+        run: |
+          echo "$(echo "${{ needs.prepare.outputs.env }}" | base64 -d)" >>$GITHUB_ENV
+
+      - name: Checkout Armbian
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ARMBIAN_REPO }}
+          ref: ${{ env.ARMBIAN_SHA }}
+
+      - name: Download kernel packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-${{ matrix.BRANCH }}
+          path: output/debs/
+
+      - name: Build system image
+        run: |
+          export GITHUB_ACTIONS=false
+          sudo --preserve-env \
+            ./compile.sh build \
+              ALLOW_ROOT=yes \
+              BOARD=onecloud \
+              BRANCH=${{ matrix.BRANCH }} \
+              RELEASE=${{ matrix.RELEASE }} \
+              KERNEL_CONFIGURE=no \
+              BUILD_MINIMAL=${{ matrix.TYPE == 'minimal' && 'yes' || 'no' }} \
+              BUILD_DESKTOP=${{ matrix.TYPE == 'desktop' && 'yes' || 'no' }} \
+              DESKTOP_ENVIRONMENT=${{ matrix.DESKTOP_ENVIRONMENT }} \
+              DESKTOP_ENVIRONMENT_CONFIG_NAME=${{ matrix.DESKTOP_ENVIRONMENT_CONFIG_NAME }} \
+              DESKTOP_APPGROUPS_SELECTED=${{ matrix.DESKTOP_APPGROUPS_SELECTED }} \
+              EXPERT=yes \
+              SKIP_EXTERNAL_TOOLCHAINS=yes \
+              CLEAN_LEVEL=none \
+              USE_CCACHE=no \
+              COMPRESS_OUTPUTIMAGE=img \
+              FORCE_BINARIES=yes
+          sudo chown -R $(id -u):$(id -g) output/
+
+      - name: Process and rename images
+        run: |
+          # 安装必要工具
+          sudo apt install -y img2simg parted
+          curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/v0.3.1/AmlImg_v0.3.1_linux_amd64
+          chmod +x ./AmlImg
+
+          # 处理普通镜像文件
+          for img in output/images/*.img; do
+            if [[ "$img" != *".burn.img" ]]; then
+              # 生成简化文件名
+              newname=$(basename "$img" | sed -E '
+                s/^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-//;
+                s/_Onecloud//g;
+                s/_armbian//gI;
+                s/_unofficial//gI;
+                s/^/OneCloud_/'
+              )
+              
+              # 重命名文件
+              mv "$img" "output/images/$newname"
+              
+              # 生成烧录版本
+              echo "Processing burning version for: $newname"
+              mkdir -p burn/
+              
+              # 下载U-Boot
+              curl -L -o ./uboot.img \
+                https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG} || {
+                echo "Failed to download U-Boot"
+                exit 1
+              }
+              
+              # 处理系统镜像
+              loop=$(sudo losetup --find --show --partscan "output/images/$newname")
+              echo "Loop device: $loop"
+              
+              # 创建稀疏镜像
+              sudo img2simg ${loop}p1 burn/boot.simg
+              sudo img2simg ${loop}p2 burn/rootfs.simg
+              sudo losetup -d $loop
+              
+              # 生成校验文件
+              echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" > burn/boot.VERIFY
+              echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" > burn/rootfs.VERIFY
+              
+              # 创建烧录命令文件
+              cat <<EOF > burn/commands.txt
+              PARTITION:boot:sparse:boot.simg
+              VERIFY:boot:normal:boot.VERIFY
+              PARTITION:rootfs:sparse:rootfs.simg
+              VERIFY:rootfs:normal:rootfs.VERIFY
+              EOF
+              
+              # 生成XML配置文件
+              cat <<EOF > burn/package.xml
+              <?xml version="1.0" encoding="utf-8"?>
+              <package>
+                <head>
+                  <product>OneCloud</product>
+                  <version>1.0</version>
+                </head>
+                <body>
+                  <command name="PARTITION" type="boot" filetype="sparse" filename="boot.simg"/>
+                  <command name="VERIFY" type="boot" verifytype="normal" filename="boot.VERIFY"/>
+                  <command name="PARTITION" type="rootfs" filetype="sparse" filename="rootfs.simg"/>
+                  <command name="VERIFY" type="rootfs" verifytype="normal" filename="rootfs.VERIFY"/>
+                </body>
+              </package>
+              EOF
+              
+              # 生成烧录镜像
+              burn_name="${newname%.*}.burn.img"
+              ./AmlImg pack "output/images/$burn_name" burn/package.xml
+              
+              # 清理临时文件
+              rm -rf burn/
+            fi
+          done
+
+          # 生成校验和并压缩
+          for f in output/images/OneCloud_*; do
+            sha256sum "$f" >> sha256sum
+            xz --threads=0 --compress "$f"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
+          path: |
+            output/images/OneCloud_*
+            sha256sum
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            output/images/OneCloud_*.img.xz
+            sha256sum
+          body: |
+            Build completed at $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')
+            
+            ### SHA256 Checksums
+            $(cat sha256sum | awk '{printf "- %s: `%s`\n", $2, $1}')
+            
+            ### Build Details
+            - Board: onecloud
+            - Branch: ${{ matrix.BRANCH }}
+            - Release: ${{ matrix.RELEASE }}
+            - Type: ${{ matrix.TYPE }}
+            ${{ matrix.TYPE == 'desktop' && '- Desktop: ' || ''}}${{ matrix.DESKTOP_ENVIRONMENT }}
