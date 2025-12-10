@@ -59,35 +59,6 @@ jobs:
           echo "Armbian: ${ARMBIAN_REPO}@${ARMBIAN_REF} (${ARMBIAN_SHA})"
           [[ -n "${PATCHES}" ]] && echo -e "\nPatches: ${PATCHES//,/, }"
 
-      - name: Generate release informations
-        run: |
-          cat <<EOF | sed -E 's/^  //' | tee Release.md
-            CI $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z(%:z)')
-
-            # Sources
-            Script: [${SCRIPT_REPO}@${SCRIPT_REF}](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_REF}) ([\`${SCRIPT_SHA}\`](https://github.com/${SCRIPT_REPO}/tree/${SCRIPT_SHA}))
-            U-Boot: [${UBOOT_REPO}@${UBOOT_RELEASE}](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_RELEASE}) ([\`${UBOOT_TAG}\`](https://github.com/${UBOOT_REPO}/releases/tag/${UBOOT_TAG}))
-            Armbian: [${ARMBIAN_REPO}@${ARMBIAN_REF}](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_REF}) ([\`${ARMBIAN_SHA}\`](https://github.com/${ARMBIAN_REPO}/tree/${ARMBIAN_SHA}))
-
-            ${PATCHES:+$(
-              echo "# Patches"
-              echo "${PATCHES}" | tr ',' '\n' | sed -E 's|(.*)|[armbian/build#\1](http://github.com/armbian/build/pull/\1)|'
-            )}
-
-            # SHA256
-          EOF
-
-          # 简化release名称
-          echo "NAME=OneCloud-$(date -d "$TIME" +'%Y%m%d')" >>$GITHUB_ENV
-          tail --line=+2 Release.md >Body.md
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: ${{ env.NAME }}
-          body_path: Body.md
-
   build-debs:
     name: Build ${{ matrix.BRANCH }}
     needs: prepare
@@ -95,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        BRANCH: [current]
+        BRANCH: [current] # 只保留current分支
 
     steps:
       - name: Import env
@@ -113,6 +84,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y jq curl img2simg
           mkdir -p config/kernel/ userpatches/kernel/archive/meson8b-6.1/
           
+          # 确保内核配置存在
           if [ ! -f "config/kernel/linux-meson8b-current.config" ]; then
             curl -L -o config/kernel/linux-meson8b-current.config \
               https://raw.githubusercontent.com/hzyitc/armbian-onecloud/main/config/kernel/linux-meson8b-current.config || \
@@ -148,14 +120,14 @@ jobs:
           path: output/debs/*
 
   build:
-    name: Build ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
+    name: Build ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
     needs: [prepare, build-debs]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        BRANCH: [current]
-        RELEASE: [jammy, bullseye, bookworm]
+        BRANCH: [current] # 只保留current分支
+        RELEASE: [jammy, bullseye, bookworm] # 常用的发行版
         TYPE: [minimal, cli, desktop]
         include:
           - TYPE: desktop
@@ -173,6 +145,18 @@ jobs:
         with:
           repository: ${{ env.ARMBIAN_REPO }}
           ref: ${{ env.ARMBIAN_SHA }}
+
+      - name: Prepare build environment
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl img2simg
+          mkdir -p config/kernel/ userpatches/kernel/archive/meson8b-6.1/
+          
+          # 确保内核配置存在
+          if [ ! -f "config/kernel/linux-meson8b-current.config" ]; then
+            curl -L -o config/kernel/linux-meson8b-current.config \
+              https://raw.githubusercontent.com/hzyitc/armbian-onecloud/main/config/kernel/linux-meson8b-current.config || \
+            echo "CONFIG_ARM=y" > config/kernel/linux-meson8b-current.config
+          fi
 
       - name: Download kernel packages
         uses: actions/download-artifact@v4
@@ -203,50 +187,64 @@ jobs:
               FORCE_BINARIES=yes
           sudo chown -R $(id -u):$(id -g) output/
 
-      - name: Process and rename images
+      - name: Install dependencies for image processing
         run: |
-          # 安装必要工具
           sudo apt install -y img2simg
           curl -L -o ./AmlImg https://github.com/hzyitc/AmlImg/releases/download/v0.3.1/AmlImg_v0.3.1_linux_amd64
           chmod +x ./AmlImg
 
-          # 处理镜像文件
-          for img in output/images/*.img; do
-            # 生成简化文件名
-            newname=$(basename "$img" | sed -E '
-              s/^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-//;
-              s/_Onecloud//g;
-              s/_armbian//gI;
-              s/_unofficial//gI;
-              s/^/OneCloud_/'
-            )
-            
-            # 重命名文件
-            mv "$img" "output/images/$newname"
-            
-            # 处理.burn.img文件
-            if [[ "$img" == *".burn.img" ]]; then
-              ./AmlImg pack "output/images/$newname" burn/
-            fi
-          done
-
-          # 生成校验和并压缩
-          for f in output/images/OneCloud_*; do
+      - name: Process and package images
+        run: |
+          # 下载U-Boot
+          curl -L -o ./uboot.img https://github.com/${UBOOT_REPO}/releases/download/${UBOOT_TAG}/${UBOOT_BURNIMG}
+          
+          # 处理系统镜像
+          diskimg=$(ls output/images/*.img)
+          loop=$(sudo losetup --find --show --partscan $diskimg)
+          mkdir -p burn/
+          sudo img2simg ${loop}p1 burn/boot.simg
+          sudo img2simg ${loop}p2 burn/rootfs.simg
+          sudo losetup -d $loop
+          
+          # 生成校验文件
+          echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" > burn/boot.VERIFY
+          echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" > burn/rootfs.VERIFY
+          
+          # 创建烧录镜像
+          cat <<EOF > burn/commands.txt
+          PARTITION:boot:sparse:boot.simg
+          VERIFY:boot:normal:boot.VERIFY
+          PARTITION:rootfs:sparse:rootfs.simg
+          VERIFY:rootfs:normal:rootfs.VERIFY
+          EOF
+          
+          prefix=$(ls output/images/*.img | sed 's/\.img$//')
+          ./AmlImg pack ${prefix}.burn.img burn/
+          
+          # 生成bin文件
+          cp ${diskimg} ${diskimg%.img}.bin
+          
+          # 压缩和校验
+          for f in output/images/*.{img,bin}; do
             sha256sum "$f" >> sha256sum
             xz --threads=0 --compress "$f"
           done
+          
+          sudo chown -R $(id -u):$(id -g) output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE }}
-          path: output/images/OneCloud_*
+          name: ${{ matrix.RELEASE }}-${{ matrix.BRANCH }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
+          path: |
+            output/images/*
+            sha256sum
 
-      - name: Upload to release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          files: output/images/OneCloud_*
+          files: output/images/*
           body: |
             Build completed at $(date -d "$TIME" +'%Y-%m-%d %H:%M:%S %Z')
             
